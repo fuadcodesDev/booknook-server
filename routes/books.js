@@ -83,4 +83,39 @@ router.post('/', async (req, res) => {
   }
 });
 
+// GET one book by ID
+router.get('/:id', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { id } = req.params;
+
+    // Check whether the ID is valid
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: 'Invalid book ID.',
+      });
+    }
+
+    // Find the book in MongoDB
+    const book = await db.collection('books').findOne({
+      _id: new ObjectId(id),
+    });
+
+    // Check whether the book exists
+    if (!book) {
+      return res.status(404).json({
+        message: 'Book not found.',
+      });
+    }
+
+    res.status(200).json(book);
+  } catch (error) {
+    console.error('Error fetching book:', error);
+
+    res.status(500).json({
+      message: 'Failed to fetch book.',
+    });
+  }
+});
+
 export default router;
