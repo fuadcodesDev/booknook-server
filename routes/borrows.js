@@ -117,4 +117,25 @@ router.post('/', async (req, res) => {
   }
 });
 
+// GET: Retrieve all borrowing records
+router.get('/', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+
+    const borrows = await db
+      .collection('borrows')
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(borrows);
+  } catch (error) {
+    console.error('Error fetching borrowing records:', error);
+
+    res.status(500).json({
+      message: 'Failed to fetch borrowing records.',
+    });
+  }
+});
+
 export default router;
