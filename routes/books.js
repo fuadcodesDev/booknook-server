@@ -187,5 +187,41 @@ router.patch('/:id', async (req, res) => {
     });
   }
 });
+// DELETE a book by ID
+router.delete('/:id', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { id } = req.params;
+
+    // Check whether the ID is valid
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: 'Invalid book ID.',
+      });
+    }
+
+    // Delete the book from MongoDB
+    const result = await db.collection('books').deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    // Check whether the book exists
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        message: 'Book not found.',
+      });
+    }
+
+    res.status(200).json({
+      message: 'Book deleted successfully!',
+    });
+  } catch (error) {
+    console.error('Error deleting book:', error);
+
+    res.status(500).json({
+      message: 'Failed to delete book.',
+    });
+  }
+});
 
 export default router;
