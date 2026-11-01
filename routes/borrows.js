@@ -2,28 +2,26 @@
 import express from 'express';
 import { ObjectId } from 'mongodb';
 import { client } from '../config/db.js';
+import { verifyToken } from '../middleware/verifyToken.js';
 
 const router = express.Router();
 
-// POST: Borrow a book using a MongoDB transaction
-router.post('/', async (req, res) => {
+// POST: Borrow a book — Login required
+router.post('/', verifyToken, async (req, res) => {
   const session = client.startSession();
 
   try {
     const db = req.app.locals.db;
 
-    const {
-      bookId,
-      userEmail,
-      borrowDate,
-      returnDate,
-    } = req.body;
+    const { bookId, borrowDate, returnDate } = req.body;
+
+    // Get the user's identity from the verified JWT
+    const normalizedEmail = req.user.email?.trim().toLowerCase();
 
     // Validate borrowing information
     if (
       !ObjectId.isValid(bookId) ||
-      typeof userEmail !== 'string' ||
-      !userEmail.trim() ||
+      !normalizedEmail ||
       !borrowDate ||
       !returnDate
     ) {
@@ -47,17 +45,13 @@ router.post('/', async (req, res) => {
 
     const booksCollection = db.collection('books');
     const borrowsCollection = db.collection('borrows');
-
-    const normalizedEmail = userEmail.trim().toLowerCase();
     const objectBookId = new ObjectId(bookId);
 
     let outcome = null;
     let savedBorrow = null;
 
-    // Start transaction
     await session.withTransaction(async () => {
-
-      // Check for an existing active borrowing
+      // Check whether this user already borrowed this book
       const existingBorrow = await borrowsCollection.findOne(
         {
           bookId: objectBookId,
@@ -72,7 +66,7 @@ router.post('/', async (req, res) => {
         return;
       }
 
-      // Decrease available copies by one
+      // Decrease available copies only when stock is available
       const updateResult = await booksCollection.updateOne(
         {
           _id: objectBookId,
@@ -94,12 +88,17 @@ router.post('/', async (req, res) => {
         return;
       }
 
-      // Find the book information
+      // Get book information
       const book = await booksCollection.findOne(
         { _id: objectBookId },
         { session }
       );
 
+      if (!book) {
+        throw new Error('Book not found after stock update.');
+      }
+
+      // Create borrowing record
       const newBorrow = {
         bookId: objectBookId,
         bookTitle: book.title,
@@ -111,7 +110,6 @@ router.post('/', async (req, res) => {
         createdAt: new Date(),
       };
 
-      // Save borrowing record
       const result = await borrowsCollection.insertOne(
         newBorrow,
         { session }
@@ -125,7 +123,6 @@ router.post('/', async (req, res) => {
       outcome = 'success';
     });
 
-    // Handle transaction results
     if (outcome === 'already-borrowed') {
       return res.status(409).json({
         message: 'You have already borrowed this book.',
@@ -162,14 +159,21 @@ router.post('/', async (req, res) => {
 });
 
 
-// GET: Retrieve all borrowing records
-router.get('/', async (req, res) => {
+// GET: Retrieve only the logged-in user's borrowing records
+router.get('/', verifyToken, async (req, res) => {
   try {
     const db = req.app.locals.db;
+    const normalizedEmail = req.user.email?.trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      return res.status(401).json({
+        message: 'User information is missing from the token.',
+      });
+    }
 
     const borrows = await db
       .collection('borrows')
-      .find()
+      .find({ userEmail: normalizedEmail })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -185,17 +189,24 @@ router.get('/', async (req, res) => {
 });
 
 
-// DELETE: Return a borrowed book using a transaction
-router.delete('/:id', async (req, res) => {
+// DELETE: Return a borrowed book — Only its borrower can return it
+router.delete('/:id', verifyToken, async (req, res) => {
   const session = client.startSession();
 
   try {
     const db = req.app.locals.db;
     const { id } = req.params;
+    const normalizedEmail = req.user.email?.trim().toLowerCase();
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         message: 'Invalid borrowing ID.',
+      });
+    }
+
+    if (!normalizedEmail) {
+      return res.status(401).json({
+        message: 'User information is missing from the token.',
       });
     }
 
@@ -204,14 +215,13 @@ router.delete('/:id', async (req, res) => {
 
     let outcome = null;
 
-    // Start transaction
     await session.withTransaction(async () => {
-
-      // Find an active borrowing record
+      // Find an active borrowing record belonging to this user
       const borrow = await borrowsCollection.findOne(
         {
           _id: new ObjectId(id),
           status: 'borrowed',
+          userEmail: normalizedEmail,
         },
         { session }
       );
@@ -221,11 +231,12 @@ router.delete('/:id', async (req, res) => {
         return;
       }
 
-      // Mark borrowing record as returned
+      // Mark it as returned, checking ownership again
       const result = await borrowsCollection.updateOne(
         {
           _id: new ObjectId(id),
           status: 'borrowed',
+          userEmail: normalizedEmail,
         },
         {
           $set: {

@@ -1,10 +1,12 @@
 
 import express from 'express';
 import { ObjectId } from 'mongodb';
+import { verifyToken } from '../middleware/verifyToken.js';
+import { client } from '../config/db.js';
 
 const router = express.Router();
 
-// GET all books
+// GET all books — Public route
 router.get('/', async (req, res) => {
   try {
     const db = req.app.locals.db;
@@ -18,14 +20,15 @@ router.get('/', async (req, res) => {
     res.status(200).json(books);
   } catch (error) {
     console.error('Error fetching books:', error);
+
     res.status(500).json({
-      message: 'Failed to fetch books',
+      message: 'Failed to fetch books.',
     });
   }
 });
 
-// POST a new book
-router.post('/', async (req, res) => {
+// POST a new book — Login required
+router.post('/', verifyToken, async (req, res) => {
   try {
     const db = req.app.locals.db;
 
@@ -42,7 +45,7 @@ router.post('/', async (req, res) => {
     if (
       !title?.trim() ||
       !author?.trim() ||
-      !category ||
+      !category?.trim() ||
       !image?.trim() ||
       !description?.trim() ||
       !Number.isInteger(totalCopies) ||
@@ -56,10 +59,15 @@ router.post('/', async (req, res) => {
     const newBook = {
       title: title.trim(),
       author: author.trim(),
-      category,
+      category: category.trim(),
       image: image.trim(),
       description: description.trim(),
       totalCopies,
+
+      // Ownership comes from the verified JWT
+      ownerId: req.user.id,
+      ownerEmail: req.user.email,
+
       createdAt: new Date(),
     };
 
@@ -83,25 +91,43 @@ router.post('/', async (req, res) => {
   }
 });
 
-// GET one book by ID
+// GET books added by the logged-in user — Login required
+router.get('/my-books', verifyToken, async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+
+    const books = await db
+      .collection('books')
+      .find({ ownerId: req.user.id })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(books);
+  } catch (error) {
+    console.error("Error fetching user's books:", error);
+
+    res.status(500).json({
+      message: 'Failed to fetch your books.',
+    });
+  }
+});
+
+// GET one book by ID — Public route
 router.get('/:id', async (req, res) => {
   try {
     const db = req.app.locals.db;
     const { id } = req.params;
 
-    // Check whether the ID is valid
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         message: 'Invalid book ID.',
       });
     }
 
-    // Find the book in MongoDB
     const book = await db.collection('books').findOne({
       _id: new ObjectId(id),
     });
 
-    // Check whether the book exists
     if (!book) {
       return res.status(404).json({
         message: 'Book not found.',
@@ -118,8 +144,8 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// PATCH: Update a book by ID
-router.patch('/:id', async (req, res) => {
+// PATCH a book — Only its owner can edit
+router.patch('/:id', verifyToken, async (req, res) => {
   try {
     const db = req.app.locals.db;
     const { id } = req.params;
@@ -133,18 +159,16 @@ router.patch('/:id', async (req, res) => {
       totalCopies,
     } = req.body;
 
-    // Check whether the ID is valid
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         message: 'Invalid book ID.',
       });
     }
 
-    // Validate the updated information
     if (
       !title?.trim() ||
       !author?.trim() ||
-      !category ||
+      !category?.trim() ||
       !image?.trim() ||
       !description?.trim() ||
       !Number.isInteger(totalCopies) ||
@@ -158,7 +182,7 @@ router.patch('/:id', async (req, res) => {
     const updatedBook = {
       title: title.trim(),
       author: author.trim(),
-      category,
+      category: category.trim(),
       image: image.trim(),
       description: description.trim(),
       totalCopies,
@@ -166,13 +190,18 @@ router.patch('/:id', async (req, res) => {
     };
 
     const result = await db.collection('books').updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updatedBook }
+      {
+        _id: new ObjectId(id),
+        ownerId: req.user.id,
+      },
+      {
+        $set: updatedBook,
+      }
     );
 
     if (result.matchedCount === 0) {
       return res.status(404).json({
-        message: 'Book not found.',
+        message: 'Book not found or you do not have permission to edit it.',
       });
     }
 
@@ -187,40 +216,99 @@ router.patch('/:id', async (req, res) => {
     });
   }
 });
-// DELETE a book by ID
-router.delete('/:id', async (req, res) => {
+
+// DELETE a book — Only its owner can delete
+// Uses a MongoDB transaction to protect against borrow/delete conflicts
+router.delete('/:id', verifyToken, async (req, res) => {
+  const session = client.startSession();
+
   try {
     const db = req.app.locals.db;
     const { id } = req.params;
 
-    // Check whether the ID is valid
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         message: 'Invalid book ID.',
       });
     }
 
-    // Delete the book from MongoDB
-    const result = await db.collection('books').deleteOne({
-      _id: new ObjectId(id),
+    const bookId = new ObjectId(id);
+
+    let response;
+
+    // Run all checks and deletion inside one transaction
+    await session.withTransaction(async () => {
+      // Check whether the book belongs to the logged-in user
+      const book = await db.collection('books').findOne(
+        {
+          _id: bookId,
+          ownerId: req.user.id,
+        },
+        { session }
+      );
+
+      if (!book) {
+        response = {
+          status: 404,
+          message: 'Book not found or you do not have permission to delete it.',
+        };
+
+        return;
+      }
+
+      // Check for active borrowing records
+      const activeBorrow = await db.collection('borrows').findOne(
+        {
+          bookId,
+          status: 'borrowed',
+        },
+        { session }
+      );
+
+      if (activeBorrow) {
+        response = {
+          status: 409,
+          message: 'This book cannot be deleted while it has active borrowing records.',
+        };
+
+        return;
+      }
+
+      // Delete the book inside the transaction
+      const result = await db.collection('books').deleteOne(
+        {
+          _id: bookId,
+          ownerId: req.user.id,
+        },
+        { session }
+      );
+
+      if (result.deletedCount === 0) {
+        response = {
+          status: 404,
+          message: 'Book not found or you do not have permission to delete it.',
+        };
+
+        return;
+      }
+
+      response = {
+        status: 200,
+        message: 'Book deleted successfully!',
+      };
     });
 
-    // Check whether the book exists
-    if (result.deletedCount === 0) {
-      return res.status(404).json({
-        message: 'Book not found.',
-      });
-    }
-
-    res.status(200).json({
-      message: 'Book deleted successfully!',
+    return res.status(response.status).json({
+      message: response.message,
     });
   } catch (error) {
     console.error('Error deleting book:', error);
 
-    res.status(500).json({
+    return res.status(500).json({
       message: 'Failed to delete book.',
     });
+  } finally {
+    await session.endSession();
   }
 });
 
