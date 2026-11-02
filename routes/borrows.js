@@ -12,14 +12,13 @@ router.post('/', verifyToken, async (req, res) => {
 
   try {
     const db = req.app.locals.db;
-
     const { bookId, borrowDate, returnDate } = req.body;
 
-    // Get the user's identity from the verified JWT
     const normalizedEmail = req.user.email?.trim().toLowerCase();
 
     // Validate borrowing information
     if (
+      !bookId ||
       !ObjectId.isValid(bookId) ||
       !normalizedEmail ||
       !borrowDate ||
@@ -51,7 +50,7 @@ router.post('/', verifyToken, async (req, res) => {
     let savedBorrow = null;
 
     await session.withTransaction(async () => {
-      // Check whether this user already borrowed this book
+      // Check for an existing active borrowing record
       const existingBorrow = await borrowsCollection.findOne(
         {
           bookId: objectBookId,
@@ -66,7 +65,7 @@ router.post('/', verifyToken, async (req, res) => {
         return;
       }
 
-      // Decrease available copies only when stock is available
+      // Decrease stock only if copies are available
       const updateResult = await booksCollection.updateOne(
         {
           _id: objectBookId,
@@ -88,7 +87,7 @@ router.post('/', verifyToken, async (req, res) => {
         return;
       }
 
-      // Get book information
+      // Get book information from the database
       const book = await booksCollection.findOne(
         { _id: objectBookId },
         { session }
@@ -149,6 +148,13 @@ router.post('/', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error borrowing book:', error);
 
+    // Unique index prevents duplicate active borrowing records
+    if (error.code === 11000) {
+      return res.status(409).json({
+        message: 'You have already borrowed this book.',
+      });
+    }
+
     return res.status(500).json({
       message: 'Failed to borrow book.',
     });
@@ -177,19 +183,19 @@ router.get('/', verifyToken, async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.status(200).json(borrows);
+    return res.status(200).json(borrows);
 
   } catch (error) {
     console.error('Error fetching borrowing records:', error);
 
-    res.status(500).json({
+    return res.status(500).json({
       message: 'Failed to fetch borrowing records.',
     });
   }
 });
 
 
-// DELETE: Return a borrowed book — Only its borrower can return it
+// DELETE: Return a book — Only its borrower can return it
 router.delete('/:id', verifyToken, async (req, res) => {
   const session = client.startSession();
 
@@ -212,6 +218,7 @@ router.delete('/:id', verifyToken, async (req, res) => {
 
     const borrowsCollection = db.collection('borrows');
     const booksCollection = db.collection('books');
+    const borrowId = new ObjectId(id);
 
     let outcome = null;
 
@@ -219,7 +226,7 @@ router.delete('/:id', verifyToken, async (req, res) => {
       // Find an active borrowing record belonging to this user
       const borrow = await borrowsCollection.findOne(
         {
-          _id: new ObjectId(id),
+          _id: borrowId,
           status: 'borrowed',
           userEmail: normalizedEmail,
         },
@@ -231,10 +238,10 @@ router.delete('/:id', verifyToken, async (req, res) => {
         return;
       }
 
-      // Mark it as returned, checking ownership again
+      // Mark the borrowing record as returned
       const result = await borrowsCollection.updateOne(
         {
-          _id: new ObjectId(id),
+          _id: borrowId,
           status: 'borrowed',
           userEmail: normalizedEmail,
         },
