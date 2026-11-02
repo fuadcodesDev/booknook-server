@@ -4,6 +4,7 @@ import cors from 'cors';
 import { connectDB } from './config/db.js';
 import booksRouter from './routes/books.js';
 import borrowsRouter from './routes/borrows.js';
+import uploadRouter from "./routes/upload.js";
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -15,6 +16,7 @@ app.use(express.json());
 // API routes
 app.use('/books', booksRouter);
 app.use('/borrows', borrowsRouter);
+app.use("/upload-image", uploadRouter);
 
 // Server test route
 app.get('/', (req, res) => {
